@@ -1,7 +1,10 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -53,4 +56,45 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 	}
 
 	return subject, nil
+}
+
+func GetBearerToken(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("authorization header missing")
+	}
+
+	const prefix = "Bearer "
+	if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
+		return "", fmt.Errorf("authorization header format must be 'Bearer {token}'")
+	}
+
+	token := authHeader[len(prefix):]
+
+	return token, nil
+}
+
+func GetApiKey(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("authorization header missing")
+	}
+
+	const prefix = "ApiKey "
+	if len(authHeader) < len(prefix) || authHeader[:len(prefix)] != prefix {
+		return "", fmt.Errorf("authorization header format must be 'ApiKey {token}'")
+	}
+
+	token := authHeader[len(prefix):]
+
+	return token, nil
+}
+
+func MakeRefreshToken() (string, error) {
+	var refreshToken [32]byte
+	_, err := rand.Read(refreshToken[:])
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(refreshToken[:]), nil
 }

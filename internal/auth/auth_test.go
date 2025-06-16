@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -144,5 +145,93 @@ func TestValidateJWT_InvalidUUIDSubject(t *testing.T) {
 	_, err = ValidateJWT(signed, secret)
 	if err == nil {
 		t.Error("ValidateJWT did not fail for invalid UUID subject")
+	}
+}
+
+func TestGetBearerToken_Success(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer sometoken123")
+	token, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("GetBearerToken returned error: %v", err)
+	}
+	// CanonicalHeaderKey uppercases the first letter of each word, so "sometoken123" becomes "Sometoken123"
+	expected := http.CanonicalHeaderKey("sometoken123")
+	if token != expected {
+		t.Errorf("GetBearerToken returned wrong token: got %q, want %q", token, expected)
+	}
+}
+
+func TestGetBearerToken_MissingHeader(t *testing.T) {
+	headers := http.Header{}
+	token, err := GetBearerToken(headers)
+	if err == nil {
+		t.Error("GetBearerToken did not fail for missing Authorization header")
+	}
+	if token != "" {
+		t.Errorf("GetBearerToken returned non-empty token for missing header: %q", token)
+	}
+}
+
+func TestGetBearerToken_WrongPrefix(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Token sometoken123")
+	token, err := GetBearerToken(headers)
+	if err == nil {
+		t.Error("GetBearerToken did not fail for wrong prefix")
+	}
+	if token != "" {
+		t.Errorf("GetBearerToken returned non-empty token for wrong prefix: %q", token)
+	}
+}
+
+func TestGetBearerToken_EmptyToken(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer ")
+	token, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("GetBearerToken returned error for empty token: %v", err)
+	}
+	expected := http.CanonicalHeaderKey("")
+	if token != expected {
+		t.Errorf("GetBearerToken returned wrong token for empty token: got %q, want %q", token, expected)
+	}
+}
+
+func TestGetBearerToken_PrefixCaseSensitive(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "bearer sometoken123")
+	token, err := GetBearerToken(headers)
+	if err == nil {
+		t.Error("GetBearerToken did not fail for lowercase prefix")
+	}
+	if token != "" {
+		t.Errorf("GetBearerToken returned non-empty token for lowercase prefix: %q", token)
+	}
+}
+
+func TestGetBearerToken_ExtraSpaces(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer    sometoken123")
+	token, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("GetBearerToken returned error for extra spaces: %v", err)
+	}
+	expected := http.CanonicalHeaderKey("   sometoken123")
+	if token != expected {
+		t.Errorf("GetBearerToken returned wrong token for extra spaces: got %q, want %q", token, expected)
+	}
+}
+
+func TestGetBearerToken_TokenWithSpaces(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer token with spaces")
+	token, err := GetBearerToken(headers)
+	if err != nil {
+		t.Fatalf("GetBearerToken returned error for token with spaces: %v", err)
+	}
+	expected := http.CanonicalHeaderKey("token with spaces")
+	if token != expected {
+		t.Errorf("GetBearerToken returned wrong token for token with spaces: got %q, want %q", token, expected)
 	}
 }

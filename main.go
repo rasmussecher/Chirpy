@@ -22,13 +22,18 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
+	polkaKey       string
 }
 
 type User struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 type Chirp struct {
@@ -53,6 +58,8 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		db:             database.New(db),
 		platform:       os.Getenv("PLATFORM"),
+		secret:         os.Getenv("SECRET"),
+		polkaKey:       os.Getenv("POLKA_KEY"),
 	}
 	mux := http.NewServeMux()
 
@@ -62,10 +69,15 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.fileserverResetHandler)
 	mux.HandleFunc("GET /api/healthz", healthCheckHandler)
 	mux.HandleFunc("POST /api/users", apiCfg.usersHandler)
+	mux.HandleFunc("PUT /api/users", apiCfg.updateUsersHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.usersLoginHandler)
+	mux.HandleFunc("POST /api/refresh", apiCfg.refreshTokenHandler)
+	mux.HandleFunc("POST /api/revoke", apiCfg.refreshTokenRevokeHandler)
 	mux.HandleFunc("POST /api/chirps", apiCfg.postChirpsHandler)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getAllChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpByIDHandler)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.polkaWebhookHandler)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirpByIDHandler)
 
 	// Server
 	server := http.Server{
@@ -84,6 +96,51 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
+func (cfg *apiConfig) polkaWebhookHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+
+	apiKey, err := auth.GetApiKey(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+
+	if apiKey != cfg.polkaKey {
+		w.WriteHeader(401)
+		return
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 400, "Invalid JSON body")
+		return
+	}
+
+	if params.Event != "user.upgraded" {
+		w.WriteHeader(204)
+		return
+	}
+
+	_, err = cfg.db.UpdateUserChirpyRed(r.Context(), database.UpdateUserChirpyRedParams{
+		ID:          params.Data.UserID,
+		IsChirpyRed: true,
+	})
+	if err != nil {
+		w.WriteHeader(404)
+		return
+	}
+	w.WriteHeader(204)
+}
+
 func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request) {
 	val, err := uuid.Parse(r.PathValue("chirpID"))
 	if err != nil {
@@ -94,7 +151,7 @@ func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request
 	chirp, err := cfg.db.GetChirpById(r.Context(), val)
 	if err != nil {
 		fmt.Println(err)
-		respondWithError(w, 500, err.Error())
+		respondWithError(w, 404, err.Error())
 		return
 	}
 	respondWithJson(w, 200, Chirp{
@@ -106,11 +163,56 @@ func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (cfg *apiConfig) deleteChirpByIDHandler(w http.ResponseWriter, r *http.Request) {
+	val, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 500, err.Error())
+		return
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Failed to validate JWT")
+		return
+	}
+
+	chirp, err := cfg.db.GetChirpById(r.Context(), val)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+
+	if chirp.UserID != userID {
+		fmt.Println("User does not have the auth to delete this Chirp:", chirp)
+		w.WriteHeader(403)
+		return
+	}
+
+	err = cfg.db.DeleteChirpById(r.Context(), chirp.ID)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 404, "Chirp not found")
+		return
+	}
+
+	w.WriteHeader(204)
+}
+
 func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request) {
 	chirps, err := cfg.db.GetAllChirps(r.Context())
 	if err != nil {
 		fmt.Println(err)
-		respondWithError(w, 500, err.Error())
+		respondWithError(w, 404, err.Error())
 		return
 	}
 	var jsonChirps []Chirp
@@ -128,27 +230,41 @@ func (cfg *apiConfig) getAllChirpsHandler(w http.ResponseWriter, r *http.Request
 
 func (cfg *apiConfig) postChirpsHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
-		Body   string    `json:"body"`
-		UserId uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	params := parameters{}
 	err := decoder.Decode(&params)
-
-	// Handle erorr in JSON decode
 	if err != nil {
-		respondWithError(w, 500, err.Error())
+		fmt.Println(err)
+		respondWithError(w, 400, "Invalid JSON body")
 		return
 	}
 
-	// Handle Chirp length error
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Failed to validate JWT")
+		return
+	}
+
+	if len(strings.TrimSpace(params.Body)) == 0 {
+		respondWithError(w, 400, "Chirp body cannot be empty")
+		return
+	}
 	if len(params.Body) > 140 {
 		respondWithError(w, 400, "Chirp is too long")
 		return
 	}
 
-	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{Body: replaceProfanity(params.Body), UserID: params.UserId})
+	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{Body: replaceProfanity(params.Body), UserID: userID})
 	if err != nil {
 		fmt.Println(err)
 		respondWithError(w, 500, err.Error())
@@ -160,7 +276,7 @@ func (cfg *apiConfig) postChirpsHandler(w http.ResponseWriter, r *http.Request) 
 		CreatedAt: chirp.CreatedAt,
 		UpdatedAt: chirp.UpdatedAt,
 		Body:      chirp.Body,
-		UserId:    chirp.UserID,
+		UserId:    userID,
 	})
 }
 
@@ -195,6 +311,121 @@ func (cfg *apiConfig) fileserverResetHandler(w http.ResponseWriter, r *http.Requ
 	w.Write([]byte(fmt.Sprintf("Deleted all hits and users")))
 }
 
+func (cfg *apiConfig) refreshTokenHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		RefreshToken string `json:"token"`
+	}
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+	refreshToken, err := cfg.db.GetRefreshTokenByToken(r.Context(), token)
+	if err != nil || refreshToken.ExpiresAt.Before(time.Now().UTC()) || refreshToken.RevokedAt.Valid {
+		fmt.Println(err)
+		respondWithError(w, 401, "Error occured getting refresh token")
+		return
+	}
+	user, err := cfg.db.GetUserFromRefreshToken(r.Context(), token)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "User not found")
+		return
+	}
+
+	jwt, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(1)*time.Hour)
+	if err != nil {
+		fmt.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	respondWithJson(w, 200, parameters{
+		RefreshToken: jwt,
+	})
+}
+
+func (cfg *apiConfig) refreshTokenRevokeHandler(w http.ResponseWriter, r *http.Request) {
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+	_, err = cfg.db.UpdateRefreshToken(r.Context(), database.UpdateRefreshTokenParams{
+		Token:     token,
+		RevokedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+	})
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 500, "Server error")
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (cfg *apiConfig) updateUsersHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	type returnUser struct {
+		ID          uuid.UUID `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
+	}
+
+	decoder := json.NewDecoder(r.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong")
+		return
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Missing or invalid auth token")
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		fmt.Println(err)
+		respondWithError(w, 401, "Failed to validate JWT")
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong")
+		return
+	}
+
+	user, err := cfg.db.UpdateUser(r.Context(), database.UpdateUserParams{
+		ID:             userID,
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+	})
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong")
+		return
+	}
+
+	respondWithJson(w, 200, returnUser{
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
+	})
+
+}
+
 func (cfg *apiConfig) usersLoginHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
 		Password string `json:"password"`
@@ -215,7 +446,6 @@ func (cfg *apiConfig) usersLoginHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	fmt.Println("CHECKING USER:", user)
 	err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
 	if err != nil {
 		fmt.Println(err)
@@ -223,11 +453,35 @@ func (cfg *apiConfig) usersLoginHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(1)*time.Hour)
+	if err != nil {
+		fmt.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	tok, _ := auth.MakeRefreshToken()
+	refreshToken, err := cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     tok,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().UTC().Add(time.Duration(1) * time.Hour),
+	})
+	if err != nil {
+		fmt.Println(err)
+		w.WriteHeader(500)
+		return
+	}
+
+	fmt.Println("Refresh token:", refreshToken.Token)
+
 	respondWithJson(w, 200, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		Token:        token,
+		RefreshToken: refreshToken.Token,
+		IsChirpyRed:  user.IsChirpyRed,
 	})
 
 }
@@ -262,12 +516,12 @@ func (cfg *apiConfig) usersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Created user:", user)
 	respondWithJson(w, 201, User{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
+		ID:          user.ID,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		Email:       user.Email,
+		IsChirpyRed: user.IsChirpyRed,
 	})
 }
 
